@@ -82,6 +82,16 @@
   <p style="color: #888888;">This gray text sits on a gradient. Parts are readable, parts are not. A wrong "fix" could make it worse, so the honest move is to leave it alone. If this text changed color, that is a bug.</p>
 </section>
 
+<section style="position: relative; min-height: 120px; border-color:#555;">
+  <!-- Gmail-bug regression test: dark background painted by a NON-ANCESTOR layer -->
+  <div style="position:absolute; inset:0; background:#202124; border-radius:8px; z-index:0;"></div>
+  <div style="position:relative; z-index:1;">
+    <h2 style="color:#ffffff;">9b. Dark-mode layer trap (the Gmail bug)</h2>
+    <span class="meta">EXPECT: UNCHANGED — this light text passes on its real dark background. The dark surface is painted by a positioned sibling, not an ancestor. v0.1.0 assumed white here and darkened this text; v0.1.1 must not.</span>
+    <p style="color:#e8eaed;">Starred · Snoozed · Important · Sent — if this line turned dark gray, the regression is back.</p>
+  </div>
+</section>
+
 <section id="dynamic-section">
   <h2>10. Dynamic content (SPA simulation)</h2>
   <span class="meta">EXPECT: new low-contrast text appears, then gets FIXED within ~a second (badge count +1)</span>

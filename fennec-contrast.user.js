@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fennec Contrast
 // @namespace    https://projectfennec.org
-// @version      0.1.0
+// @version      0.1.1
 // @description  🦊 Project Fennec — fixes low-contrast text as you browse. User-controlled, transparent, undoable. Contrast only; nothing else.
 // @author       Project Fennec (projectfennec.org)
 // @license      MIT
@@ -24,6 +24,14 @@
  *    (background images, gradients, heavy transparency), we DON'T touch the text.
  *    A wrong fix is worse than no fix.
  *  - Privacy: no network calls, no analytics, no data leaves the page. Ever.
+ *
+ * v0.1.1 (2026-07-05) — Dark-mode fix, from the first field bug report:
+ *   v0.1.0 assumed a white background when no ancestor declared one, which
+ *   darkened light text in dark-mode apps (Gmail) whose backgrounds live on
+ *   non-ancestor layers or the browser canvas. Now: (1) hit-test the layers
+ *   painted beneath the text via elementsFromPoint, (2) treat a dark
+ *   color-scheme canvas as unknowable, (3) never "fix" near-white text
+ *   against a merely-assumed white background.
  */
 
 (function () {
@@ -223,14 +231,74 @@
       current = current.parentElement;
     }
 
-    // No opaque background anywhere: browsers paint white by default, but if
-    // transparent layers are stacked we're less sure. Composite over white.
+    // No opaque background on any ancestor. v0.1.0 assumed white here and
+    // that broke dark-mode apps (Gmail bug report, 2026-07-05): their dark
+    // backgrounds are painted by NON-ANCESTOR layers, or by the browser
+    // canvas itself under color-scheme: dark. Corroborate before trusting.
+
+    // Recovery 1: look for a background layer painted underneath the element
+    const layerBg = findLayerBackground(element);
+    if (layerBg) {
+      if (!layerBg.confident || !layerBg.rgb) return { rgb: null, confident: false };
+      let result = layerBg.rgb;
+      for (let i = layers.length - 1; i >= 0; i--) {
+        result = compositeOver(layers[i], result);
+      }
+      return { rgb: result, confident: true };
+    }
+
+    // Recovery 2: if the page opted into a dark canvas, "white" is a lie. Skip.
+    const rootScheme = (getComputedStyle(document.documentElement).colorScheme || '').toLowerCase();
+    const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    if (rootScheme.includes('dark') && (prefersDark || !rootScheme.includes('light'))) {
+      return { rgb: null, confident: false };
+    }
+
+    // Last resort: assume the default white canvas — but flag it as an
+    // ASSUMPTION so checkAndFix can apply extra suspicion.
     let result = { r: 255, g: 255, b: 255, a: 1 };
     for (let i = layers.length - 1; i >= 0; i--) {
       result = compositeOver(layers[i], result);
     }
-    // Confident only if no partial layers muddied the water.
-    return { rgb: result, confident: layers.length === 0 };
+    return { rgb: result, confident: layers.length === 0, assumed: true };
+  }
+
+  /**
+   * Find an opaque background painted UNDER the element by a non-ancestor
+   * layer (position:absolute/fixed siblings — how Gmail and many dark-mode
+   * apps paint their surfaces). Uses the hit-test stack at the element's
+   * center. Returns {rgb, confident} or null if unavailable (offscreen etc).
+   */
+  function findLayerBackground(element) {
+    const rect = element.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return null;
+
+    let stack;
+    try { stack = document.elementsFromPoint(x, y); } catch (e) { return null; }
+    if (!stack || stack.length === 0) return null;
+
+    let below = false;
+    for (const el of stack) {
+      if (!below) {
+        if (el === element) below = true;
+        continue;
+      }
+      if (el.contains(element)) continue; // ancestors already checked by the walk
+      const cs = getComputedStyle(el);
+      if (cs.backgroundImage && cs.backgroundImage !== 'none') {
+        return { rgb: null, confident: false }; // image layer under text: can't know
+      }
+      const bg = parseColor(cs.backgroundColor);
+      if (bg && bg.a >= 1) {
+        return { rgb: { r: bg.r, g: bg.g, b: bg.b, a: 1 }, confident: true };
+      }
+      if (bg && bg.a > 0) {
+        return { rgb: null, confident: false }; // stacked translucent layers: too risky
+      }
+    }
+    return null;
   }
 
   // ------------------------------------------------------------------
@@ -311,6 +379,11 @@
 
     // Composite semi-transparent text over its background first
     const effectiveFg = fg.a < 1 ? compositeOver(fg, bgInfo.rgb) : fg;
+
+    // Suspicion guard: very light text + a background we only ASSUMED to be
+    // white is the signature of a dark-mode app we failed to read (the Gmail
+    // bug). Designers don't put near-white text on white on purpose. Skip.
+    if (bgInfo.assumed && luminance(effectiveFg) > 0.5) return false;
 
     const target = requiredContrast(cs);
     const ratio = contrastRatio(effectiveFg, bgInfo.rgb);
@@ -502,7 +575,7 @@
       scan(document.body);
       startObserver();
     }
-    console.log('🦊 Fennec Contrast v0.1.0 loaded —', enabled ? 'active' : 'paused', '(Alt+Shift+C to toggle)');
+    console.log('🦊 Fennec Contrast v0.1.1 loaded —', enabled ? 'active' : 'paused', '(Alt+Shift+C to toggle)');
   }
 
   if (document.readyState === 'loading') {
