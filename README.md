@@ -20,7 +20,7 @@ Part of [Project Fennec](https://projectfennec.org) — web without barriers.
 
 A small 🦊 badge appears in the bottom-right corner of every page, showing how many text elements were adjusted.
 
-**Verify it works:** open the [live test page](https://YOUR-USERNAME.github.io/fennec-contrast/fennec-test-page.html) — the badge should show **7**, and the page explains what each section should (and shouldn't) do.
+**Verify it works:** open the [live test page](https://Mrdali1362.github.io/fennec-contrast/fennec-test-page.html) — the badge should show **7**, and the page explains what each section should (and shouldn't) do.
 
 ## Controls
 
