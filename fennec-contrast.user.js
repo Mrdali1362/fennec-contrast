@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fennec Contrast
 // @namespace    https://projectfennec.org
-// @version      0.1.1
+// @version      0.1.7
 // @description  🦊 Project Fennec — fixes low-contrast text as you browse. User-controlled, transparent, undoable. Contrast only; nothing else.
 // @author       Project Fennec (projectfennec.org)
 // @license      MIT
@@ -9,6 +9,7 @@
 // @exclude      *://localhost:*/*
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        unsafeWindow
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -32,6 +33,67 @@
  *   painted beneath the text via elementsFromPoint, (2) treat a dark
  *   color-scheme canvas as unknowable, (3) never "fix" near-white text
  *   against a merely-assumed white background.
+ *
+ * v0.1.2 (2026-07-06) — Same Gmail bug persisted; architectural fix:
+ *   Background detection is now PAINT-ORDER-FIRST (hit-test stack via
+ *   elementsFromPoint) instead of DOM-ancestor-first. The ancestor walk can
+ *   report a background that exists in the DOM but is visually painted over
+ *   by another layer — the hit-test stack reflects what's actually drawn.
+ *   Ancestor walk demoted to fallback for offscreen elements. Added
+ *   diagnostics: Alt+Shift+D (or window.fennecReport()) dumps every fix
+ *   with its detected colors, ratios, and background source.
+ *
+ * v0.1.3 (2026-07-06) — Transparency for humans, not just developers:
+ *   tester feedback: "it shows 1 issue but I can't see what it is." The
+ *   badge now opens a panel listing every change in plain language
+ *   (text snippet + before/after contrast ratios); selecting one scrolls
+ *   to and highlights the element. Undo moved into the panel. Alt+Shift+C
+ *   still toggles instantly; Escape closes the panel.
+ *
+ * v0.1.4 (2026-07-07) — Explain the silences, not just the fixes:
+ *   field case: axe flagged orange banner text that Fennec skipped, and
+ *   the diagnostics couldn't say why — Fennec only logged actions, never
+ *   abstentions. Added why-mode: Alt+Shift+W then click any text (or
+ *   fennecWhy($0) in the console) prints the full decision trace —
+ *   visibility, detected colors, background source, thresholds, measured
+ *   ratio, and the exact skip reason or would-be fix. Dry-run only.
+ *
+ * v0.1.5 (2026-07-07) — One number, one meaning:
+ *   tester report: badge said 3, panel showed 1. The badge counted every
+ *   fix since page load; the panel counted only elements still in the DOM.
+ *   SPA re-renders remove fixed elements, leaving ghost counts. Now stale
+ *   fixes are pruned everywhere the count is shown: detached elements are
+ *   reverted and released for fresh evaluation if the site re-attaches
+ *   them. Badge and panel now always answer the same question: fixes
+ *   ACTIVE on this page right now. Also: tiny/symbol-only text entries in
+ *   the panel now say what element they are.
+ *
+ * v0.1.6 (2026-07-07) — The polarity rule; a fix must never look worse:
+ *   field report: white price digits on saturated red-orange (≈3.8:1,
+ *   a WCAG 2 failure) were "fixed" to a passing 4.5:1 gray that human
+ *   eyes read as WORSE. That's a known flaw in the WCAG 2 formula (it
+ *   ignores polarity; APCA/WCAG 3 addresses it). New rule: fixes may
+ *   never flip text across its light/dark polarity — light text stays
+ *   light, dark stays dark. If the target ratio is unreachable on the
+ *   text's own side, Fennec refuses and leaves the design alone (traced
+ *   as an explicit skip reason in why-mode). Sole exception: text with
+ *   ~identical luminance to its background (invisible) may be rescued in
+ *   either direction. Full unit suite re-run: all regressions pass, the
+ *   price-tag case is now refused.
+ *
+ * v0.1.7 (2026-07-07) — The #949494 postmortem; worst bug so far:
+ *   tester proved a "fix" of #949494 on #FF3927 = 1.2:1 — Fennec made
+ *   text nearly invisible. Root cause: the red shape was a ::before
+ *   pseudo-element, invisible to BOTH background resolvers, so Fennec
+ *   confidently resolved "white", saw white-on-white, and the v0.1.6
+ *   invisible-text exception rescued it into the minimal 3.0:1 gray for
+ *   white — #949494 exactly (fingerprint verified in unit tests: that
+ *   gray on the real red = 1.18:1, matching the report). Three fixes:
+ *   (1) painted ::before/::after anywhere in the resolution chain now
+ *   means the background is unknowable — skip; (2) the invisible-text
+ *   rescue exception is removed — polarity rule is now absolute;
+ *   (3) sanity check: text (nearly) identical to its resolved background
+ *   is hidden text or a misread — never colorized. 13/13 unit tests pass.
  */
 
 (function () {
@@ -156,30 +218,25 @@
 
   /**
    * Find the minimal adjustment of `fg` that reaches `target` contrast against `bg`.
-   * Blends toward black or white with a binary search on the blend factor,
-   * preserving as much of the original hue (site's design intent) as possible.
-   * Returns an opaque {r,g,b} or null if the target is unreachable in either direction.
+   * Blends toward black or white with a binary search on the blend factor.
+   *
+   * POLARITY RULE (v0.1.6, tightened v0.1.7): the fix must never flip text
+   * across its light/dark polarity. If the required ratio can't be reached
+   * on the text's own side, return null and leave the text alone. The
+   * v0.1.6 "invisible text rescue" exception is REMOVED: text matching its
+   * resolved background is more often the signature of a MISREAD background
+   * (pseudo-element case, 2026-07-07: white price digits "rescued" to a
+   * 1.2:1 gray) or intentionally hidden text — both mean don't touch.
    */
   function generateAccessibleColor(fg, bg, target) {
-    const towardBlackMax = contrastRatio(BLACK, bg);
-    const towardWhiteMax = contrastRatio(WHITE, bg);
-
-    // Prefer the direction the text already leans (dark text gets darker,
-    // light text gets lighter), falling back to whichever direction can
-    // actually reach the target ratio.
     const fgIsDarker = luminance(fg) < luminance(bg);
-    let directions = fgIsDarker ? [BLACK, WHITE] : [WHITE, BLACK];
-    directions = directions.filter(d =>
-      (d === BLACK ? towardBlackMax : towardWhiteMax) >= target
-    );
-    if (directions.length === 0) {
-      // Target unreachable (mid-gray background). Take max-contrast endpoint.
-      const best = towardBlackMax >= towardWhiteMax ? BLACK : WHITE;
-      return contrastRatio(best, bg) > contrastRatio(fg, bg) ? best : null;
+    const endpoint = fgIsDarker ? BLACK : WHITE;
+
+    if (contrastRatio(endpoint, bg) < target) {
+      return null; // refuse: unreachable without flipping polarity
     }
 
-    const endpoint = directions[0];
-    // Binary search the smallest t where contrast >= target
+    // Binary search the smallest blend factor where contrast >= target
     let lo = 0, hi = 1, best = null;
     for (let i = 0; i < 24; i++) {
       const mid = (lo + hi) / 2;
@@ -199,78 +256,91 @@
   // ------------------------------------------------------------------
 
   /**
-   * Walk up from the element compositing semi-transparent backgrounds until an
-   * opaque one is found. Returns { rgb, confident } — confident is false when
-   * a background-image/gradient sits anywhere in the chain (we can't know the
-   * pixels behind the text) or when we had to fall back to assuming white.
-   * When not confident, we skip. No guessing.
+   * v0.1.2: Background resolution is now PAINT-ORDER-FIRST. The DOM-ancestor
+   * walk (v0.1.0/0.1.1) can be fooled by backgrounds that exist in the DOM but
+   * are visually painted over by other layers (dark themes over legacy light
+   * containers — suspected Gmail root cause). The hit-test stack reflects what
+   * the browser actually draws, in order, including non-ancestor layers.
    */
   function getEffectiveBackground(element) {
+    // PRIMARY: what is actually painted beneath this element
+    const visual = getVisualBackground(element);
+    if (visual) return visual;
+
+    // FALLBACK (element offscreen or not hit-testable): DOM-ancestor walk
     let current = element;
     const layers = []; // semi-transparent bg colors, innermost first
 
     while (current && current.nodeType === Node.ELEMENT_NODE) {
+      if (hasPseudoBackground(current)) {
+        return { rgb: null, confident: false, source: 'ancestor:pseudo-element' };
+      }
       const cs = getComputedStyle(current);
 
       if (cs.backgroundImage && cs.backgroundImage !== 'none') {
-        return { rgb: null, confident: false };
+        return { rgb: null, confident: false, source: 'ancestor:image' };
       }
 
       const bg = parseColor(cs.backgroundColor);
       if (bg && bg.a > 0) {
         if (bg.a >= 1) {
-          // Opaque base found — composite the transparent layers above it
           let result = { r: bg.r, g: bg.g, b: bg.b, a: 1 };
           for (let i = layers.length - 1; i >= 0; i--) {
             result = compositeOver(layers[i], result);
           }
-          return { rgb: result, confident: true };
+          return { rgb: result, confident: true, source: 'ancestor' };
         }
         layers.push(bg);
       }
       current = current.parentElement;
     }
 
-    // No opaque background on any ancestor. v0.1.0 assumed white here and
-    // that broke dark-mode apps (Gmail bug report, 2026-07-05): their dark
-    // backgrounds are painted by NON-ANCESTOR layers, or by the browser
-    // canvas itself under color-scheme: dark. Corroborate before trusting.
-
-    // Recovery 1: look for a background layer painted underneath the element
-    const layerBg = findLayerBackground(element);
-    if (layerBg) {
-      if (!layerBg.confident || !layerBg.rgb) return { rgb: null, confident: false };
-      let result = layerBg.rgb;
-      for (let i = layers.length - 1; i >= 0; i--) {
-        result = compositeOver(layers[i], result);
-      }
-      return { rgb: result, confident: true };
-    }
-
-    // Recovery 2: if the page opted into a dark canvas, "white" is a lie. Skip.
+    // Nothing declared anywhere. If the page opted into a dark canvas,
+    // "white" is a lie — skip rather than guess.
     const rootScheme = (getComputedStyle(document.documentElement).colorScheme || '').toLowerCase();
     const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
     if (rootScheme.includes('dark') && (prefersDark || !rootScheme.includes('light'))) {
-      return { rgb: null, confident: false };
+      return { rgb: null, confident: false, source: 'canvas:dark' };
     }
 
-    // Last resort: assume the default white canvas — but flag it as an
-    // ASSUMPTION so checkAndFix can apply extra suspicion.
+    // Last resort: assume the default white canvas — flagged as an ASSUMPTION
+    // so checkAndFix applies the light-text suspicion guard.
     let result = { r: 255, g: 255, b: 255, a: 1 };
     for (let i = layers.length - 1; i >= 0; i--) {
       result = compositeOver(layers[i], result);
     }
-    return { rgb: result, confident: layers.length === 0, assumed: true };
+    return { rgb: result, confident: layers.length === 0, assumed: true, source: 'assumed-white' };
   }
 
   /**
-   * Find an opaque background painted UNDER the element by a non-ancestor
-   * layer (position:absolute/fixed siblings — how Gmail and many dark-mode
-   * apps paint their surfaces). Uses the hit-test stack at the element's
-   * center. Returns {rgb, confident} or null if unavailable (offscreen etc).
+   * v0.1.7: Pseudo-element backgrounds (::before/::after with a fill) are
+   * invisible to BOTH resolvers — they're not DOM ancestors and don't appear
+   * in elementsFromPoint. A skewed ::before painted the red price tag that
+   * both methods looked straight through, resolving "white" with full
+   * confidence. If any element in the chain carries a painted pseudo, we
+   * can't know what's really behind the text. Honesty rule: skip.
    */
-  function findLayerBackground(element) {
+  function hasPseudoBackground(el) {
+    for (const which of ['::before', '::after']) {
+      let ps;
+      try { ps = getComputedStyle(el, which); } catch (e) { continue; }
+      if (!ps || !ps.content || ps.content === 'none') continue;
+      if (ps.backgroundImage && ps.backgroundImage !== 'none') return true;
+      const bg = parseColor(ps.backgroundColor);
+      if (bg && bg.a > 0) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Resolve the background by walking the hit-test stack at the element's
+   * center — top to bottom in PAINT order. Composites translucent layers,
+   * stops at the first opaque one. Returns null when the element can't be
+   * hit-tested (offscreen, covered in a way that hides it from the stack).
+   */
+  function getVisualBackground(element) {
     const rect = element.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
     if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return null;
@@ -279,26 +349,37 @@
     try { stack = document.elementsFromPoint(x, y); } catch (e) { return null; }
     if (!stack || stack.length === 0) return null;
 
-    let below = false;
-    for (const el of stack) {
-      if (!below) {
-        if (el === element) below = true;
-        continue;
+    // Start at the element itself; if an overlay hides it from the stack
+    // (transparent click-targets are common), start at its nearest ancestor
+    // present in the stack — everything from there down is painted beneath.
+    let start = stack.indexOf(element);
+    if (start === -1) {
+      start = stack.findIndex(el => el !== element && el.contains(element));
+      if (start === -1) return null;
+    }
+
+    const layers = [];
+    for (let i = start; i < stack.length; i++) {
+      if (hasPseudoBackground(stack[i])) {
+        return { rgb: null, confident: false, source: 'visual:pseudo-element' };
       }
-      if (el.contains(element)) continue; // ancestors already checked by the walk
-      const cs = getComputedStyle(el);
+      const cs = getComputedStyle(stack[i]);
       if (cs.backgroundImage && cs.backgroundImage !== 'none') {
-        return { rgb: null, confident: false }; // image layer under text: can't know
+        return { rgb: null, confident: false, source: 'visual:image' };
       }
       const bg = parseColor(cs.backgroundColor);
-      if (bg && bg.a >= 1) {
-        return { rgb: { r: bg.r, g: bg.g, b: bg.b, a: 1 }, confident: true };
-      }
       if (bg && bg.a > 0) {
-        return { rgb: null, confident: false }; // stacked translucent layers: too risky
+        if (bg.a >= 1) {
+          let result = { r: bg.r, g: bg.g, b: bg.b, a: 1 };
+          for (let j = layers.length - 1; j >= 0; j--) {
+            result = compositeOver(layers[j], result);
+          }
+          return { rgb: result, confident: true, source: 'visual' };
+        }
+        layers.push(bg);
       }
     }
-    return null;
+    return null; // fell through to canvas — let the fallback logic decide
   }
 
   // ------------------------------------------------------------------
@@ -361,36 +442,80 @@
 
   let processed = new WeakSet();
   let fixedElements = new Set();
+  let fixLog = []; // debug records: why each fix happened (Alt+Shift+D to dump)
   let enabled = loadEnabled();
   let scanScheduled = false;
 
-  function checkAndFix(el) {
+  function checkAndFix(el, trace) {
+    const t = trace ? (m) => trace.push(m) : null;
     const cs = getComputedStyle(el);
-    if (!isVisible(el, cs)) return false;
+    if (!isVisible(el, cs)) {
+      if (t) t('SKIP: element not visible (display/visibility/opacity/zero-size)');
+      return false;
+    }
 
     // Text with shadows or strokes has contrast we can't model — leave it alone.
-    if (cs.webkitTextStroke && parseFloat(cs.webkitTextStrokeWidth) > 0) return false;
+    if (cs.webkitTextStroke && parseFloat(cs.webkitTextStrokeWidth) > 0) {
+      if (t) t('SKIP: text-stroke present — contrast not modelable');
+      return false;
+    }
 
     const fg = parseColor(cs.color);
-    if (!fg) return false;
+    if (!fg) {
+      if (t) t('SKIP: could not parse text color: ' + cs.color);
+      return false;
+    }
+    if (t) t('Text color: ' + cs.color);
 
     const bgInfo = getEffectiveBackground(el);
-    if (!bgInfo.confident || !bgInfo.rgb) return false; // honesty rule: don't guess
+    if (t) t('Background: ' + (bgInfo.rgb ? `rgb(${bgInfo.rgb.r},${bgInfo.rgb.g},${bgInfo.rgb.b})` : 'UNRESOLVED')
+      + ` — source: ${bgInfo.source || '?'}, confident: ${!!bgInfo.confident}${bgInfo.assumed ? ', ASSUMED' : ''}`);
+    if (!bgInfo.confident || !bgInfo.rgb) {
+      if (t) t('SKIP: background not confidently resolved (image/gradient/translucent layers in paint stack, or dark canvas) — honesty rule: Fennec does not guess');
+      return false; // honesty rule: don't guess
+    }
 
     // Composite semi-transparent text over its background first
     const effectiveFg = fg.a < 1 ? compositeOver(fg, bgInfo.rgb) : fg;
+    if (t && fg.a < 1) t(`Text has alpha ${fg.a} — composited to rgb(${effectiveFg.r},${effectiveFg.g},${effectiveFg.b})`);
 
     // Suspicion guard: very light text + a background we only ASSUMED to be
     // white is the signature of a dark-mode app we failed to read (the Gmail
     // bug). Designers don't put near-white text on white on purpose. Skip.
-    if (bgInfo.assumed && luminance(effectiveFg) > 0.5) return false;
+    if (bgInfo.assumed && luminance(effectiveFg) > 0.5) {
+      if (t) t('SKIP: near-white text on a merely-ASSUMED white background (dark-mode guard)');
+      return false;
+    }
 
     const target = requiredContrast(cs);
+    if (t) t(`Font: ${cs.fontSize}, weight ${cs.fontWeight} → ${target === 3 ? 'LARGE text' : 'normal text'}, required ratio ${target}:1`);
     const ratio = contrastRatio(effectiveFg, bgInfo.rgb);
-    if (ratio >= target) return false;
+    if (t) t(`Measured contrast: ${ratio.toFixed(2)}:1`);
+
+    // Sanity check (v0.1.7): text that is (nearly) the SAME color as its
+    // resolved background is either intentionally hidden text or the
+    // signature of a background we misread. Colorizing it is wrong in both
+    // cases — this is how white price digits became 1.2:1 gray.
+    if (ratio < 1.05) {
+      if (t) t('SKIP: text and resolved background are essentially the same color — either intentionally hidden text or Fennec misread the background. Refusing to colorize.');
+      return false;
+    }
+
+    if (ratio >= target) {
+      if (t) t(`PASS: ${ratio.toFixed(2)} ≥ ${target} — no fix needed`);
+      return false;
+    }
 
     const fixed = generateAccessibleColor(effectiveFg, bgInfo.rgb, target);
-    if (!fixed) return false;
+    if (!fixed) {
+      if (t) t('SKIP: reaching the required ratio would flip the text\'s light/dark polarity (e.g., white→gray on a colored background). WCAG 2 math would call that a pass; human eyes would call it worse. Fennec refuses.');
+      return false;
+    }
+
+    if (t) {
+      t(`WOULD FIX: rgb(${fixed.r},${fixed.g},${fixed.b}) → ${contrastRatio(fixed, bgInfo.rgb).toFixed(2)}:1 (diagnosis is a dry run; nothing was applied)`);
+      return false;
+    }
 
     // Remember the element's own inline color (may be empty) so undo is exact
     if (!el.hasAttribute(ORIGINAL_ATTR)) {
@@ -399,29 +524,61 @@
       el.setAttribute(ORIGINAL_ATTR, inline === '' ? NO_INLINE : `${inline}|${priority}`);
     }
 
+    const newRatio = contrastRatio(fixed, bgInfo.rgb);
     el.style.setProperty('color', `rgb(${fixed.r}, ${fixed.g}, ${fixed.b})`, 'important');
-    el.setAttribute(FIXED_ATTR, `${ratio.toFixed(2)}->${contrastRatio(fixed, bgInfo.rgb).toFixed(2)}`);
+    el.setAttribute(FIXED_ATTR, `${ratio.toFixed(2)}->${newRatio.toFixed(2)} via ${bgInfo.source || 'unknown'}`);
     fixedElements.add(el);
+    fixLog.push({
+      el,
+      tag: el.tagName.toLowerCase(),
+      text: (el.textContent || '').trim().slice(0, 40),
+      fg: `rgb(${effectiveFg.r},${effectiveFg.g},${effectiveFg.b})`,
+      bg: `rgb(${bgInfo.rgb.r},${bgInfo.rgb.g},${bgInfo.rgb.b})`,
+      bgSource: bgInfo.source || 'unknown',
+      before: +ratio.toFixed(2),
+      after: +newRatio.toFixed(2),
+      target
+    });
     return true;
+  }
+
+  /**
+   * v0.1.5: Prune fixes whose elements the site has removed from the DOM
+   * (SPA re-renders). The badge counted every fix ever made; the panel only
+   * showed living ones — two different numbers for the same question.
+   * Pruned elements are reverted (free — they're detached) and released
+   * from `processed`, so if the site re-attaches them they get a fresh
+   * evaluation instead of stale bookkeeping.
+   */
+  function pruneStale() {
+    for (const el of fixedElements) {
+      if (!el.isConnected) {
+        try { revertElement(el); } catch (e) { /* already gone entirely */ }
+        processed.delete(el);
+        fixedElements.delete(el);
+      }
+    }
+    fixLog = fixLog.filter(f => f.el && f.el.isConnected);
+  }
+
+  function revertElement(el) {
+    const original = el.getAttribute(ORIGINAL_ATTR);
+    if (original === NO_INLINE || original === null) {
+      el.style.removeProperty('color');
+    } else {
+      const sep = original.lastIndexOf('|');
+      el.style.setProperty('color', original.slice(0, sep), original.slice(sep + 1));
+    }
+    el.removeAttribute(ORIGINAL_ATTR);
+    el.removeAttribute(FIXED_ATTR);
   }
 
   function undoAll() {
     for (const el of fixedElements) {
-      try {
-        const original = el.getAttribute(ORIGINAL_ATTR);
-        if (original === NO_INLINE || original === null) {
-          el.style.removeProperty('color');
-        } else {
-          const sep = original.lastIndexOf('|');
-          const value = original.slice(0, sep);
-          const priority = original.slice(sep + 1);
-          el.style.setProperty('color', value, priority);
-        }
-        el.removeAttribute(ORIGINAL_ATTR);
-        el.removeAttribute(FIXED_ATTR);
-      } catch (e) { /* element may be gone */ }
+      try { revertElement(el); } catch (e) { /* element may be gone */ }
     }
     fixedElements = new Set();
+    fixLog = [];
     processed = new WeakSet();
     updateBadge();
   }
@@ -516,24 +673,30 @@
       'cursor:pointer', 'box-shadow:0 2px 8px rgba(0,0,0,0.35)',
       'opacity:0.92'
     ].join(';');
-    badge.addEventListener('click', toggle);
+    badge.addEventListener('click', onBadgeActivate);
     badge.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onBadgeActivate(); }
     });
     document.body.appendChild(badge);
     updateBadge();
   }
 
+  function onBadgeActivate() {
+    if (!enabled) { toggle(); return; }
+    openPanel();
+  }
+
   function updateBadge() {
     if (!badge) return;
+    pruneStale();
     const n = fixedElements.size;
     if (enabled) {
       badge.textContent = n > 0 ? `🦊 ${n}` : '🦊';
       badge.setAttribute('aria-label',
         n > 0
-          ? `Fennec Contrast is on. ${n} low-contrast text ${n === 1 ? 'element' : 'elements'} adjusted on this page. Press to turn off and undo all changes.`
-          : 'Fennec Contrast is on. No contrast issues found on this page. Press to turn off.');
-      badge.title = n > 0 ? `Fennec: ${n} contrast fix${n === 1 ? '' : 'es'} active — click to undo & pause` : 'Fennec Contrast active — click to pause';
+          ? `Fennec Contrast is on. ${n} low-contrast text ${n === 1 ? 'element' : 'elements'} adjusted on this page. Press to review the changes.`
+          : 'Fennec Contrast is on. No contrast issues found on this page. Press for options.');
+      badge.title = n > 0 ? `Fennec: ${n} contrast fix${n === 1 ? '' : 'es'} — click to review` : 'Fennec Contrast active — click for options';
       badge.style.background = '#1a4731';
     } else {
       badge.textContent = '🦊 off';
@@ -554,7 +717,114 @@
       stopObserver();
       undoAll();
     }
+    if (panel) closePanel();
     updateBadge();
+  }
+
+  // ------------------------------------------------------------------
+  // Fixes panel — transparency without DevTools
+  // ------------------------------------------------------------------
+
+  let panel = null;
+
+  const BTN_BASE = [
+    'display:block', 'width:100%', 'text-align:left', 'min-height:44px',
+    'padding:10px 12px', 'margin:0 0 6px 0', 'background:#ffffff', 'color:#1a1a1a',
+    'border:1px solid #767676', 'border-radius:8px',
+    'font:400 14px/1.4 system-ui, Arial, sans-serif', 'cursor:pointer'
+  ].join(';');
+
+  function openPanel() {
+    if (panel) { closePanel(); return; }
+    pruneStale();
+
+    panel = document.createElement('div');
+    panel.id = 'fennec-panel';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', 'Fennec Contrast: changes on this page');
+    panel.style.cssText = [
+      'position:fixed', 'bottom:72px', 'right:16px', 'z-index:2147483647',
+      'width:min(340px, calc(100vw - 32px))', 'max-height:min(420px, 70vh)',
+      'overflow-y:auto', 'background:#ffffff', 'color:#1a1a1a',
+      'border:2px solid #1a4731', 'border-radius:12px', 'padding:14px',
+      'font:400 14px/1.5 system-ui, Arial, sans-serif',
+      'box-shadow:0 4px 16px rgba(0,0,0,0.35)'
+    ].join(';');
+
+    const heading = document.createElement('h2');
+    heading.textContent = '🦊 Fennec Contrast';
+    heading.style.cssText = 'font-size:16px;margin:0 0 4px 0;color:#1a4731;';
+    panel.appendChild(heading);
+
+    const entries = fixLog.filter(f => f.el && f.el.isConnected);
+    const intro = document.createElement('p');
+    intro.style.cssText = 'margin:0 0 10px 0;font-size:13px;';
+    intro.textContent = entries.length === 0
+      ? (enabled ? 'No text was changed on this page.' : 'Fennec is paused. No changes active.')
+      : `${entries.length} low-contrast text ${entries.length === 1 ? 'element' : 'elements'} adjusted. Select one to highlight it on the page:`;
+    panel.appendChild(intro);
+
+    entries.forEach((f, i) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.style.cssText = BTN_BASE;
+      const label = f.text && f.text.length >= 3
+        ? `“${f.text}${f.text.length >= 40 ? '…' : ''}”`
+        : (f.text ? `“${f.text}” (a small <${f.tag}> element)` : `<${f.tag}> element`);
+      btn.textContent = `${i + 1}. ${label} — contrast ${f.before}:1 → ${f.after}:1`;
+      btn.setAttribute('aria-label',
+        `Change ${i + 1} of ${entries.length}: ${f.text || f.tag + ' element'}. ` +
+        `Contrast improved from ${f.before} to 1, to ${f.after} to 1. Press to highlight it on the page.`);
+      btn.addEventListener('click', () => highlightFix(f.el));
+      panel.appendChild(btn);
+    });
+
+    if (entries.length > 0) {
+      const undoBtn = document.createElement('button');
+      undoBtn.type = 'button';
+      undoBtn.style.cssText = BTN_BASE + ';background:#1a4731;color:#ffffff;border-color:#1a4731;font-weight:600;margin-top:4px;';
+      undoBtn.textContent = 'Undo all & pause Fennec';
+      undoBtn.addEventListener('click', toggle);
+      panel.appendChild(undoBtn);
+    }
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.style.cssText = BTN_BASE + ';margin-bottom:0;';
+    closeBtn.textContent = 'Close';
+    closeBtn.addEventListener('click', closePanel);
+    panel.appendChild(closeBtn);
+
+    document.body.appendChild(panel);
+    document.addEventListener('keydown', panelEscHandler, true);
+    const first = panel.querySelector('button');
+    if (first) first.focus();
+  }
+
+  function closePanel() {
+    if (!panel) return;
+    document.removeEventListener('keydown', panelEscHandler, true);
+    panel.remove();
+    panel = null;
+    if (badge) badge.focus();
+  }
+
+  function panelEscHandler(e) {
+    if (e.key === 'Escape') { e.preventDefault(); closePanel(); }
+  }
+
+  function highlightFix(el) {
+    if (!el || !el.isConnected) return;
+    const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    el.scrollIntoView({ block: 'center', behavior: reduceMotion ? 'auto' : 'smooth' });
+    const prevOutline = el.style.outline;
+    const prevOffset = el.style.outlineOffset;
+    el.style.outline = '3px solid #c2410c';
+    el.style.outlineOffset = '2px';
+    setTimeout(() => {
+      el.style.outline = prevOutline;
+      el.style.outlineOffset = prevOffset;
+    }, 2500);
   }
 
   // Keyboard shortcut: Alt+Shift+C toggles without touching the mouse
@@ -563,7 +833,88 @@
       e.preventDefault();
       toggle();
     }
+    // Alt+Shift+D: dump a diagnostic report of every fix to the console
+    if (e.altKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
+      e.preventDefault();
+      dumpReport();
+    }
+    // Alt+Shift+W: why-mode — click any text to get a decision trace
+    if (e.altKey && e.shiftKey && (e.key === 'W' || e.key === 'w')) {
+      e.preventDefault();
+      toggleWhyMode();
+    }
   });
+
+  function dumpReport() {
+    console.group('🦊 Fennec Contrast v0.1.7 — diagnostic report');
+    console.log('Enabled:', enabled, '| Fixes on this page:', fixLog.length);
+    console.log('Root color-scheme:', getComputedStyle(document.documentElement).colorScheme,
+      '| prefers-color-scheme dark:', window.matchMedia('(prefers-color-scheme: dark)').matches);
+    if (fixLog.length) {
+      console.table(fixLog);
+      console.log('For a wrong fix: note its bgSource. "visual" = paint-order hit-test, ' +
+        '"ancestor" = DOM walk fallback, "assumed-white" = default canvas assumption.');
+    } else {
+      console.log('No fixes applied.');
+    }
+    console.groupEnd();
+  }
+
+  // Also reachable from the console for testers: window.fennecReport()
+  try {
+    const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    w.fennecReport = dumpReport;
+    w.fennecWhy = diagnoseElement;
+  } catch (e) { /* sandboxed */ }
+
+  // ------------------------------------------------------------------
+  // Why-mode: Alt+Shift+W, then click any text → full decision trace
+  // ------------------------------------------------------------------
+
+  let whyMode = false;
+
+  function toggleWhyMode() {
+    whyMode = !whyMode;
+    document.documentElement.style.cursor = whyMode ? 'crosshair' : '';
+    console.log(whyMode
+      ? '🦊 Why-mode ON — click any text on the page and Fennec will explain its decision in this console. (Click is intercepted; nothing will activate.)'
+      : '🦊 Why-mode off.');
+  }
+
+  document.addEventListener('click', (e) => {
+    if (!whyMode) return;
+    e.preventDefault();
+    e.stopPropagation();
+    whyMode = false;
+    document.documentElement.style.cursor = '';
+    diagnoseElement(e.target);
+  }, true);
+
+  /**
+   * Explain Fennec's decision for an element: finds the nearest text-bearing
+   * element (click targets are often inner spans/icons) and runs the full
+   * check pipeline in dry-run mode, printing every step and skip reason.
+   * Console: fennecWhy($0) after selecting an element in the inspector.
+   */
+  function diagnoseElement(target) {
+    let el = target;
+    while (el && el.nodeType === Node.ELEMENT_NODE && !hasDirectText(el)) {
+      el = el.parentElement;
+    }
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) {
+      console.log('🦊 No text-bearing element found there. Try clicking directly on text.');
+      return;
+    }
+    const snippet = (el.textContent || '').trim().slice(0, 50);
+    console.group(`🦊 Fennec diagnosis — <${el.tagName.toLowerCase()}> “${snippet}”`);
+    if (el.hasAttribute(FIXED_ATTR)) {
+      console.log('This element WAS fixed by Fennec:', el.getAttribute(FIXED_ATTR));
+    }
+    const trace = [];
+    try { checkAndFix(el, trace); } catch (err) { trace.push('ERROR during check: ' + err.message); }
+    trace.forEach(line => console.log('•', line));
+    console.groupEnd();
+  }
 
   // ------------------------------------------------------------------
   // Boot
@@ -575,7 +926,7 @@
       scan(document.body);
       startObserver();
     }
-    console.log('🦊 Fennec Contrast v0.1.1 loaded —', enabled ? 'active' : 'paused', '(Alt+Shift+C to toggle)');
+    console.log('🦊 Fennec Contrast v0.1.7 loaded (Alt+Shift+W = why-mode) —', enabled ? 'active' : 'paused', '(Alt+Shift+C to toggle)');
   }
 
   if (document.readyState === 'loading') {
